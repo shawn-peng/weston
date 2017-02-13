@@ -132,6 +132,10 @@ weston_desktop_xwayland_surface_committed(struct weston_desktop_surface *dsurfac
 {
 	struct weston_desktop_xwayland_surface *surface = user_data;
 
+#ifdef WM_DEBUG
+	weston_log("%s: xwayland surface %p\n", __func__, surface);
+#endif
+
 	if (surface->has_next_geometry) {
 		surface->has_next_geometry = false;
 		weston_desktop_surface_set_geometry(surface->surface,
@@ -241,6 +245,8 @@ create_surface(struct weston_desktop_xwayland *xwayland,
 	wl_resource_add_destroy_listener(wsurface->resource,
 					 &surface->resource_destroy_listener);
 
+	weston_desktop_surface_set_pid(surface->surface, 0);
+
 	return surface;
 }
 
@@ -249,6 +255,16 @@ set_toplevel(struct weston_desktop_xwayland_surface *surface)
 {
 	weston_desktop_xwayland_surface_change_state(surface, TOPLEVEL, NULL,
 						     0, 0);
+}
+
+static void
+set_toplevel_with_position(struct weston_desktop_xwayland_surface *surface,
+			   int32_t x, int32_t y)
+{
+	weston_desktop_xwayland_surface_change_state(surface, TOPLEVEL, NULL,
+						     0, 0);
+	weston_desktop_api_set_xwayland_position(surface->desktop,
+						 surface->surface, x, y);
 }
 
 static void
@@ -355,6 +371,7 @@ set_pid(struct weston_desktop_xwayland_surface *surface, pid_t pid)
 static const struct weston_desktop_xwayland_interface weston_desktop_xwayland_interface = {
 	.create_surface = create_surface,
 	.set_toplevel = set_toplevel,
+	.set_toplevel_with_position = set_toplevel_with_position,
 	.set_parent = set_parent,
 	.set_transient = set_transient,
 	.set_fullscreen = set_fullscreen,
@@ -380,7 +397,11 @@ weston_desktop_xwayland_init(struct weston_desktop *desktop)
 	xwayland->desktop = desktop;
 	xwayland->client = weston_desktop_client_create(desktop, NULL, NULL, NULL, NULL, 0, 0);
 
-	weston_layer_init(&xwayland->layer, &compositor->cursor_layer.link);
+	weston_layer_init(&xwayland->layer, compositor);
+	/* We put this layer on top of regular shell surfaces, but hopefully
+	 * below any UI the shell would add */
+	weston_layer_set_position(&xwayland->layer,
+				  WESTON_LAYER_POSITION_NORMAL + 1);
 
 	compositor->xwayland = xwayland;
 	compositor->xwayland_interface = &weston_desktop_xwayland_interface;

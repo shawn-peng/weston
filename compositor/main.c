@@ -78,6 +78,7 @@ struct wet_compositor {
 	struct weston_config *config;
 	struct wet_output_config *parsed_options;
 	struct wl_listener pending_output_listener;
+	bool drm_use_current_mode;
 };
 
 static FILE *weston_logfile = NULL;
@@ -761,7 +762,7 @@ weston_create_listening_socket(struct wl_display *display, const char *socket_na
 }
 
 WL_EXPORT void *
-wet_load_module(const char *name, const char *entrypoint)
+wet_load_module_entrypoint(const char *name, const char *entrypoint)
 {
 	const char *builddir = getenv("WESTON_BUILD_DIR");
 	char path[PATH_MAX];
@@ -812,14 +813,43 @@ wet_load_module(const char *name, const char *entrypoint)
 	return init;
 }
 
+
+WL_EXPORT int
+wet_load_module(struct weston_compositor *compositor,
+	        const char *name, int *argc, char *argv[])
+{
+	int (*module_init)(struct weston_compositor *ec,
+			   int *argc, char *argv[]);
+
+	module_init = wet_load_module_entrypoint(name, "wet_module_init");
+	if (!module_init)
+		return -1;
+	if (module_init(compositor, argc, argv) < 0)
+		return -1;
+	return 0;
+}
+
+static int
+wet_load_shell(struct weston_compositor *compositor,
+	       const char *name, int *argc, char *argv[])
+{
+	int (*shell_init)(struct weston_compositor *ec,
+			  int *argc, char *argv[]);
+
+	shell_init = wet_load_module_entrypoint(name, "wet_shell_init");
+	if (!shell_init)
+		return -1;
+	if (shell_init(compositor, argc, argv) < 0)
+		return -1;
+	return 0;
+}
+
 static int
 load_modules(struct weston_compositor *ec, const char *modules,
-	     int *argc, char *argv[])
+	     int *argc, char *argv[], int32_t *xwayland)
 {
 	const char *p, *end;
 	char buffer[256];
-	int (*module_init)(struct weston_compositor *ec,
-			   int *argc, char *argv[]);
 
 	if (modules == NULL)
 		return 0;
@@ -830,19 +860,19 @@ load_modules(struct weston_compositor *ec, const char *modules,
 		snprintf(buffer, sizeof buffer, "%.*s", (int) (end - p), p);
 
 		if (strstr(buffer, "xwayland.so")) {
-			if (wet_load_xwayland(ec) < 0)
-				return -1;
+			weston_log("Old Xwayland module loading detected: "
+				   "Please use --xwayland command line option "
+				   "or set xwayland=true in the [core] section "
+				   "in weston.ini\n");
+			*xwayland = 1;
 		} else {
-			module_init = wet_load_module(buffer, "module_init");
-			if (!module_init)
-				return -1;
-			if (module_init(ec, argc, argv) < 0)
+			if (wet_load_module(ec, buffer, argc, argv) < 0)
 				return -1;
 		}
+
 		p = end;
 		while (*p == ',')
 			p++;
-
 	}
 
 	return 0;
@@ -1125,6 +1155,7 @@ drm_backend_output_configure(struct wl_listener *listener, void *data)
 {
 	struct weston_output *output = data;
 	struct weston_config *wc = wet_get_config(output->compositor);
+	struct wet_compositor *wet = to_wet_compositor(output->compositor);
 	struct weston_config_section *section;
 	const struct weston_drm_output_api *api = weston_drm_output_get_api(output->compositor);
 	enum weston_drm_backend_output_mode mode =
@@ -1147,7 +1178,7 @@ drm_backend_output_configure(struct wl_listener *listener, void *data)
 		weston_output_disable(output);
 		free(s);
 		return;
-	} else if (strcmp(s, "current") == 0) {
+	} else if (wet->drm_use_current_mode || strcmp(s, "current") == 0) {
 		mode = WESTON_DRM_BACKEND_OUTPUT_CURRENT;
 	} else if (strcmp(s, "preferred") != 0) {
 		modeline = s;
@@ -1185,13 +1216,16 @@ load_drm_backend(struct weston_compositor *c,
 {
 	struct weston_drm_backend_config config = {{ 0, }};
 	struct weston_config_section *section;
+	struct wet_compositor *wet = to_wet_compositor(c);
 	int ret = 0;
+
+	wet->drm_use_current_mode = false;
 
 	const struct weston_option options[] = {
 		{ WESTON_OPTION_INTEGER, "connector", 0, &config.connector },
 		{ WESTON_OPTION_STRING, "seat", 0, &config.seat_id },
 		{ WESTON_OPTION_INTEGER, "tty", 0, &config.tty },
-		{ WESTON_OPTION_BOOLEAN, "current-mode", 0, &config.use_current_mode },
+		{ WESTON_OPTION_BOOLEAN, "current-mode", 0, &wet->drm_use_current_mode },
 		{ WESTON_OPTION_BOOLEAN, "use-pixman", 0, &config.use_pixman },
 	};
 
@@ -1730,6 +1764,7 @@ int main(int argc, char *argv[])
 	int i, fd;
 	char *backend = NULL;
 	char *shell = NULL;
+	int32_t xwayland = 0;
 	char *modules = NULL;
 	char *option_modules = NULL;
 	char *log = NULL;
@@ -1754,6 +1789,7 @@ int main(int argc, char *argv[])
 		{ WESTON_OPTION_STRING, "shell", 0, &shell },
 		{ WESTON_OPTION_STRING, "socket", 'S', &socket_name },
 		{ WESTON_OPTION_INTEGER, "idle-time", 'i', &idle_time },
+		{ WESTON_OPTION_BOOLEAN, "xwayland", 0, &xwayland },
 		{ WESTON_OPTION_STRING, "modules", 0, &option_modules },
 		{ WESTON_OPTION_STRING, "log", 0, &log },
 		{ WESTON_OPTION_BOOLEAN, "help", 'h', &help },
@@ -1884,15 +1920,23 @@ int main(int argc, char *argv[])
 		weston_config_section_get_string(section, "shell", &shell,
 						 "desktop-shell.so");
 
-	if (load_modules(ec, shell, &argc, argv) < 0)
+	if (wet_load_shell(ec, shell, &argc, argv) < 0)
 		goto out;
 
 	weston_config_section_get_string(section, "modules", &modules, "");
-	if (load_modules(ec, modules, &argc, argv) < 0)
+	if (load_modules(ec, modules, &argc, argv, &xwayland) < 0)
 		goto out;
 
-	if (load_modules(ec, option_modules, &argc, argv) < 0)
+	if (load_modules(ec, option_modules, &argc, argv, &xwayland) < 0)
 		goto out;
+
+	if (!xwayland)
+		weston_config_section_get_bool(section, "xwayland", &xwayland,
+					       false);
+	if (xwayland) {
+		if (wet_load_xwayland(ec) < 0)
+			goto out;
+	}
 
 	section = weston_config_get_section(config, "keyboard", NULL, NULL);
 	weston_config_section_get_bool(section, "numlock-on", &numlock_on, 0);

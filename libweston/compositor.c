@@ -269,6 +269,7 @@ weston_view_create(struct weston_surface *surface)
 		return NULL;
 
 	view->surface = surface;
+	view->plane = &surface->compositor->primary_plane;
 
 	/* Assign to surface */
 	wl_list_insert(&surface->views, &view->surface_link);
@@ -2178,6 +2179,12 @@ view_list_add_subsurface_view(struct weston_compositor *compositor,
 	}
 }
 
+/* This recursively adds the sub-surfaces for a view, relying on the
+ * sub-surface order. Thus, if a client restacks the sub-surfaces, that
+ * change first happens to the sub-surface list, and then automatically
+ * propagates here. See weston_surface_damage_subsurfaces() for how the
+ * sub-surfaces receive damage when the client changes the state.
+ */
 static void
 view_list_add(struct weston_compositor *compositor,
 	      struct weston_view *view)
@@ -2334,15 +2341,30 @@ output_repaint_timer_handler(void *data)
 {
 	struct weston_output *output = data;
 	struct weston_compositor *compositor = output->compositor;
+	int ret;
 
-	if (output->repaint_needed &&
-	    compositor->state != WESTON_COMPOSITOR_SLEEPING &&
-	    compositor->state != WESTON_COMPOSITOR_OFFSCREEN &&
-	    weston_output_repaint(output) == 0)
-		return 0;
+	/* If we're sleeping, drop the repaint machinery entirely; we will
+	 * explicitly repaint all outputs when we come back. */
+	if (compositor->state == WESTON_COMPOSITOR_SLEEPING ||
+	    compositor->state == WESTON_COMPOSITOR_OFFSCREEN)
+		goto err;
 
+	/* We don't actually need to repaint this output; drop it from
+	 * repaint until something causes damage. */
+	if (!output->repaint_needed)
+		goto err;
+
+	/* If repaint fails, we aren't going to get weston_output_finish_frame
+	 * to trigger a new repaint, so drop it from repaint and hope
+	 * something schedules a successful repaint later. */
+	ret = weston_output_repaint(output);
+	if (ret != 0)
+		goto err;
+
+	return 0;
+
+err:
 	weston_output_schedule_repaint_reset(output);
-
 	return 0;
 }
 
@@ -2421,14 +2443,62 @@ weston_layer_entry_remove(struct weston_layer_entry *entry)
 	entry->layer = NULL;
 }
 
+
+/** Initialize the weston_layer struct.
+ *
+ * \param compositor The compositor instance
+ * \param layer The layer to initialize
+ */
 WL_EXPORT void
-weston_layer_init(struct weston_layer *layer, struct wl_list *below)
+weston_layer_init(struct weston_layer *layer,
+		  struct weston_compositor *compositor)
 {
+	layer->compositor = compositor;
+	wl_list_init(&layer->link);
 	wl_list_init(&layer->view_list.link);
 	layer->view_list.layer = layer;
 	weston_layer_set_mask_infinite(layer);
-	if (below != NULL)
-		wl_list_insert(below, &layer->link);
+}
+
+/** Sets the position of the layer in the layer list. The layer will be placed
+ * below any layer with the same position value, if any.
+ * This function is safe to call if the layer is already on the list, but the
+ * layer may be moved below other layers at the same position, if any.
+ *
+ * \param layer The layer to modify
+ * \param position The position the layer will be placed at
+ */
+WL_EXPORT void
+weston_layer_set_position(struct weston_layer *layer,
+			  enum weston_layer_position position)
+{
+	struct weston_layer *below;
+
+	wl_list_remove(&layer->link);
+
+	/* layer_list is ordered from top to bottom, the last layer being the
+	 * background with the smallest position value */
+
+	layer->position = position;
+	wl_list_for_each_reverse(below, &layer->compositor->layer_list, link) {
+		if (below->position >= layer->position) {
+			wl_list_insert(&below->link, &layer->link);
+			return;
+		}
+	}
+	wl_list_insert(&layer->compositor->layer_list, &layer->link);
+}
+
+/** Hide a layer by taking it off the layer list.
+ * This function is safe to call if the layer is not on the list.
+ *
+ * \param layer The layer to hide
+ */
+WL_EXPORT void
+weston_layer_unset_position(struct weston_layer *layer)
+{
+	wl_list_remove(&layer->link);
+	wl_list_init(&layer->link);
 }
 
 WL_EXPORT void
@@ -2618,6 +2688,24 @@ surface_set_input_region(struct wl_client *client,
 	}
 }
 
+/* Cause damage to this sub-surface and all its children.
+ *
+ * This is useful when there are state changes that need an implicit
+ * damage, e.g. a z-order change.
+ */
+static void
+weston_surface_damage_subsurfaces(struct weston_subsurface *sub)
+{
+	struct weston_subsurface *child;
+
+	weston_surface_damage(sub->surface);
+	sub->reordered = false;
+
+	wl_list_for_each(child, &sub->surface->subsurface_list, parent_link)
+		if (child != sub)
+			weston_surface_damage_subsurfaces(child);
+}
+
 static void
 weston_surface_commit_subsurface_order(struct weston_surface *surface)
 {
@@ -2627,6 +2715,9 @@ weston_surface_commit_subsurface_order(struct weston_surface *surface)
 				 parent_link_pending) {
 		wl_list_remove(&sub->parent_link);
 		wl_list_insert(&surface->subsurface_list, &sub->parent_link);
+
+		if (sub->reordered)
+			weston_surface_damage_subsurfaces(sub);
 	}
 }
 
@@ -3576,6 +3667,8 @@ subsurface_place_above(struct wl_client *client,
 	wl_list_remove(&sub->parent_link_pending);
 	wl_list_insert(sibling->parent_link_pending.prev,
 		       &sub->parent_link_pending);
+
+	sub->reordered = true;
 }
 
 static void
@@ -3598,6 +3691,8 @@ subsurface_place_below(struct wl_client *client,
 	wl_list_remove(&sub->parent_link_pending);
 	wl_list_insert(&sibling->parent_link_pending,
 		       &sub->parent_link_pending);
+
+	sub->reordered = true;
 }
 
 static void
@@ -3932,10 +4027,9 @@ weston_compositor_wake(struct weston_compositor *compositor)
 
 	switch (old_state) {
 	case WESTON_COMPOSITOR_SLEEPING:
-		weston_compositor_dpms(compositor, WESTON_DPMS_ON);
-		/* fall through */
 	case WESTON_COMPOSITOR_IDLE:
 	case WESTON_COMPOSITOR_OFFSCREEN:
+		weston_compositor_dpms(compositor, WESTON_DPMS_ON);
 		wl_signal_emit(&compositor->wake_signal, compositor);
 		/* fall through */
 	default:
@@ -3951,10 +4045,6 @@ weston_compositor_wake(struct weston_compositor *compositor)
  * This is used for example to prevent further rendering while the
  * compositor is shutting down.
  *
- * \note When offscreen state is entered, outputs will be powered
- * back on if they were sleeping (in DPMS off mode), even though
- * no rendering will be performed.
- *
  * Stops the idle timer.
  */
 WL_EXPORT void
@@ -3964,8 +4054,6 @@ weston_compositor_offscreen(struct weston_compositor *compositor)
 	case WESTON_COMPOSITOR_OFFSCREEN:
 		return;
 	case WESTON_COMPOSITOR_SLEEPING:
-		weston_compositor_dpms(compositor, WESTON_DPMS_ON);
-		/* fall through */
 	default:
 		compositor->state = WESTON_COMPOSITOR_OFFSCREEN;
 		wl_event_source_timer_update(compositor->idle_source, 0);
@@ -4332,7 +4420,7 @@ weston_output_enable_undo(struct weston_output *output)
  * applies the necessary changes.
  * All views assigned to the weston_output object are
  * moved to a new output.
- * Signal is emited to notify all users of the weston_output
+ * Signal is emitted to notify all users of the weston_output
  * object that the output is being destroyed.
  * wl_output protocol objects referencing this weston_output
  * are made inert.
@@ -5042,8 +5130,12 @@ weston_compositor_create(struct wl_display *display, void *user_data)
 	loop = wl_display_get_event_loop(ec->wl_display);
 	ec->idle_source = wl_event_loop_add_timer(loop, idle_handler, ec);
 
-	weston_layer_init(&ec->fade_layer, &ec->layer_list);
-	weston_layer_init(&ec->cursor_layer, &ec->fade_layer.link);
+	weston_layer_init(&ec->fade_layer, ec);
+	weston_layer_init(&ec->cursor_layer, ec);
+
+	weston_layer_set_position(&ec->fade_layer, WESTON_LAYER_POSITION_FADE);
+	weston_layer_set_position(&ec->cursor_layer,
+				  WESTON_LAYER_POSITION_CURSOR);
 
 	weston_compositor_add_debug_binding(ec, KEY_T,
 					    timeline_key_binding_handler, ec);
@@ -5353,7 +5445,7 @@ weston_compositor_load_backend(struct weston_compositor *compositor,
 	if (backend >= ARRAY_LENGTH(backend_map))
 		return -1;
 
-	backend_init = weston_load_module(backend_map[backend], "backend_init");
+	backend_init = weston_load_module(backend_map[backend], "weston_backend_init");
 	if (!backend_init)
 		return -1;
 
@@ -5363,14 +5455,12 @@ weston_compositor_load_backend(struct weston_compositor *compositor,
 WL_EXPORT int
 weston_compositor_load_xwayland(struct weston_compositor *compositor)
 {
-	int (*module_init)(struct weston_compositor *ec,
-			   int *argc, char *argv[]);
-	int argc = 0;
+	int (*module_init)(struct weston_compositor *ec);
 
-	module_init = weston_load_module("xwayland.so", "module_init");
+	module_init = weston_load_module("xwayland.so", "weston_module_init");
 	if (!module_init)
 		return -1;
-	if (module_init(compositor, &argc, NULL) < 0)
+	if (module_init(compositor) < 0)
 		return -1;
 	return 0;
 }

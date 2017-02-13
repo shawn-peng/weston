@@ -1575,7 +1575,7 @@ error:
 	if (fin)
 		fclose(fin);
 	free(buffer);
-	errno = errsv || EINVAL;
+	errno = errsv ? errsv : EINVAL;
 
 	return NULL;
 }
@@ -1603,10 +1603,6 @@ main(int argc, char *argv[])
 	}
 
 	memset(&editor, 0, sizeof editor);
-
-#ifdef HAVE_PANGO
-	g_type_init();
-#endif
 
 	editor.display = display_create(&argc, argv);
 	if (editor.display == NULL) {
