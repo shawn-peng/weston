@@ -66,6 +66,8 @@ flags = [
 '.',
 '-isystem',
 '/usr/include/pixman-1/',
+'-isystem',
+'/usr/include/libdrm/',
 ]
 
 
